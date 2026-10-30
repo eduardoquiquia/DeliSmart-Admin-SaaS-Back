@@ -22,3 +22,9 @@ class CheckoutSessionSerializer(serializers.Serializer):
         if value in RESERVED_SUBDOMAINS:
             raise serializers.ValidationError('Este subdominio está reservado.')
         return value
+
+
+class TenantStatusSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Tenant
+        fields = ('subdomain', 'restaurant_name', 'plan_id', 'status')

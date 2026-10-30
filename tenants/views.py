@@ -3,6 +3,7 @@ import logging
 import stripe
 from django.conf import settings
 from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 from rest_framework import status
@@ -11,7 +12,8 @@ from rest_framework.response import Response
 from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
 
-from .serializers import CheckoutSessionSerializer
+from .models import Tenant
+from .serializers import CheckoutSessionSerializer, TenantStatusSerializer
 from .services import SubdomainTaken, provision_tenant, start_checkout
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,15 @@ class CreateCheckoutSessionView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
         return Response({'checkout_url': session.url}, status=status.HTTP_201_CREATED)
+
+
+class TenantStatusView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def get(self, request, subdomain):
+        tenant = get_object_or_404(Tenant.objects.exclude(status=Tenant.Status.PENDING), subdomain=subdomain)
+        return Response(TenantStatusSerializer(tenant).data)
 
 
 @csrf_exempt
