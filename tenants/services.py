@@ -1,13 +1,17 @@
+import calendar
 import logging
 import secrets
+from datetime import UTC, datetime
+from decimal import Decimal
 
 import stripe
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 
-from .models import Tenant
+from .models import Licencia, PagoStripe, Tenant
 from .plans import stripe_price_data
 
 logger = logging.getLogger(__name__)
@@ -26,8 +30,8 @@ def start_checkout(data):
     client = get_stripe_client()
     tenant = _reserve_subdomain(client, data)
     metadata = {
-        'subdomain': tenant.subdomain,
-        'restaurant_name': tenant.restaurant_name,
+        'subdomain': tenant.subdominio,
+        'restaurant_name': tenant.nombre,
         'plan_id': tenant.plan_id,
     }
     try:
@@ -40,7 +44,7 @@ def start_checkout(data):
             }],
             'metadata': metadata,
             'subscription_data': {'metadata': metadata},
-            'success_url': f'{settings.LANDING_URL}/checkout/exito?subdomain={tenant.subdomain}',
+            'success_url': f'{settings.LANDING_URL}/checkout/exito?subdomain={tenant.subdominio}',
             'cancel_url': f'{settings.LANDING_URL}/#planes',
         })
     except stripe.StripeError:
@@ -57,7 +61,7 @@ def _reserve_subdomain(client, data):
     anterior en Stripe, así dos personas nunca pagan por el mismo subdominio.
     """
     with transaction.atomic():
-        tenant = Tenant.objects.select_for_update().filter(subdomain=data['subdomain']).first()
+        tenant = Tenant.objects.select_for_update().filter(subdominio=data['subdominio']).first()
         if tenant is None:
             try:
                 with transaction.atomic():
@@ -65,7 +69,7 @@ def _reserve_subdomain(client, data):
             except IntegrityError as exc:
                 raise SubdomainTaken from exc
 
-        if tenant.status != Tenant.Status.PENDING or not tenant.stripe_session_id:
+        if tenant.estado != Tenant.Status.PENDING or not tenant.stripe_session_id:
             raise SubdomainTaken
 
         previous = client.v1.checkout.sessions.retrieve(tenant.stripe_session_id)
@@ -74,12 +78,23 @@ def _reserve_subdomain(client, data):
         if previous.status == 'open':
             client.v1.checkout.sessions.expire(tenant.stripe_session_id)
 
-        tenant.restaurant_name = data['restaurant_name']
+        tenant.nombre = data['nombre']
         tenant.plan_id = data['plan_id']
         tenant.billing_cycle = data['billing_cycle']
         tenant.stripe_session_id = ''
         tenant.save()
         return tenant
+
+
+def _add_months(start, months):
+    month_index = start.month - 1 + months
+    year = start.year + month_index // 12
+    month = month_index % 12 + 1
+    return start.replace(year=year, month=month, day=min(start.day, calendar.monthrange(year, month)[1]))
+
+
+def _soles(cents):
+    return Decimal(cents) / 100
 
 
 @transaction.atomic
@@ -91,35 +106,112 @@ def provision_tenant(session):
 
     tenant = (
         Tenant.objects.select_for_update()
-        .filter(subdomain=session.metadata.subdomain, stripe_session_id=session.id)
+        .filter(subdominio=session.metadata.subdomain, stripe_session_id=session.id)
         .first()
     )
     if tenant is None:
         logger.error('Pago sin tenant reservado: sesión %s', session.id)
         return
-    if tenant.status != Tenant.Status.PENDING:
+    if tenant.estado != Tenant.Status.PENDING:
         return
 
     email = session.customer_details.email
     password = secrets.token_urlsafe(12)
     tenant.owner = get_user_model().objects.create_user(
-        username=tenant.subdomain,
+        username=tenant.subdominio,
         email=email,
         password=password,
     )
-    tenant.status = Tenant.Status.ACTIVE
+    tenant.estado = Tenant.Status.ACTIVE
+    tenant.email_admin = email
+    tenant.telefono = session.customer_details.phone or ''
     tenant.stripe_customer_id = session.customer or ''
-    tenant.stripe_subscription_id = session.subscription or ''
     tenant.save()
+
+    today = timezone.localdate()
+    months = 12 if tenant.billing_cycle == Tenant.BillingCycle.ANNUAL else 1
+    amount = _soles(session.amount_total)
+    Licencia.objects.create(
+        restaurante=tenant,
+        plan=tenant.plan_id,
+        fecha_inicio=today,
+        fecha_vencimiento=_add_months(today, months),
+        monto_pagado=amount,
+        stripe_subscription_id=session.subscription or '',
+    )
+    PagoStripe.objects.create(
+        restaurante=tenant,
+        stripe_checkout_id=session.id,
+        monto=amount,
+        moneda=session.currency,
+        raw_payload=session.to_dict(),
+    )
 
     # Si el correo falla se revierte todo y Stripe reintenta: la contraseña no se guarda en claro.
     send_mail(
-        subject=f'Tu acceso a DeliSmart: {tenant.restaurant_name}',
+        subject=f'Tu acceso a DeliSmart: {tenant.nombre}',
         message=(
-            f'Tu restaurante ya está activo en https://{tenant.subdomain}.{settings.ROOT_DOMAIN}\n\n'
-            f'Usuario: {tenant.subdomain}\n'
+            f'Tu restaurante ya está activo en https://{tenant.subdominio}.{settings.ROOT_DOMAIN}\n\n'
+            f'Usuario: {tenant.subdominio}\n'
             f'Contraseña temporal: {password}\n'
         ),
         from_email=None,
         recipient_list=[email],
     )
+
+
+def _invoice_subscription_id(invoice):
+    # La API de Stripe movió este campo a `parent`; las cuentas antiguas siguen enviando el anterior.
+    data = invoice.to_dict()
+    details = (data.get('parent') or {}).get('subscription_details') or {}
+    return details.get('subscription') or data.get('subscription')
+
+
+@transaction.atomic
+def renew_license(invoice):
+    """Registra el cobro de una renovación y extiende la licencia. Stripe puede repetir el evento."""
+    # El primer cobro ya entra por checkout.session.completed.
+    if invoice.billing_reason == 'subscription_create':
+        return
+
+    subscription_id = _invoice_subscription_id(invoice)
+    license_ = (
+        Licencia.objects.select_for_update().filter(stripe_subscription_id=subscription_id).first()
+        if subscription_id
+        else None
+    )
+    if license_ is None:
+        logger.error('Factura sin licencia: %s', invoice.id)
+        return
+
+    amount = _soles(invoice.amount_paid)
+    _, created = PagoStripe.objects.get_or_create(
+        stripe_checkout_id=invoice.id,
+        defaults={
+            'restaurante_id': license_.restaurante_id,
+            'monto': amount,
+            'moneda': invoice.currency,
+            'raw_payload': invoice.to_dict(),
+        },
+    )
+    if not created:
+        return
+
+    period_end = max(line.period.end for line in invoice.lines.data)
+    license_.fecha_vencimiento = timezone.localdate(datetime.fromtimestamp(period_end, tz=UTC))
+    license_.monto_pagado += amount
+    license_.estado = Licencia.Status.ACTIVE
+    license_.save()
+
+
+@transaction.atomic
+def cancel_subscription(subscription):
+    """Stripe da por terminada la suscripción: se cancela la licencia y se corta el acceso."""
+    license_ = (
+        Licencia.objects.select_for_update().filter(stripe_subscription_id=subscription.id).first()
+    )
+    if license_ is None:
+        return
+    license_.estado = Licencia.Status.CANCELLED
+    license_.save()
+    Tenant.objects.filter(pk=license_.restaurante_id).update(estado=Tenant.Status.SUSPENDED)

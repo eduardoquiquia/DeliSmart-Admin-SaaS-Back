@@ -2,6 +2,8 @@ import hashlib
 import hmac
 import json
 import time
+from datetime import timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -10,9 +12,10 @@ from django.contrib.auth import get_user_model
 from django.core import mail
 from django.core.cache import cache
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import Tenant
+from .models import Licencia, PagoStripe, Tenant
 from .plans import stripe_price_data
 
 CHECKOUT_URL = '/api/stripe/create-checkout-session/'
@@ -70,8 +73,8 @@ class CreateCheckoutSessionTests(TestCase):
             'restaurant_name': 'El Sabrosito',
             'plan_id': 'pro',
         })
-        tenant = Tenant.objects.get(subdomain='elsabrosito')
-        self.assertEqual(tenant.status, Tenant.Status.PENDING)
+        tenant = Tenant.objects.get(subdominio='elsabrosito')
+        self.assertEqual(tenant.estado, Tenant.Status.PENDING)
         self.assertEqual(tenant.stripe_session_id, 'cs_new')
 
     def test_rejects_invalid_and_reserved_subdomains(self):
@@ -83,24 +86,24 @@ class CreateCheckoutSessionTests(TestCase):
         self.assertEqual(self.post(stripe_client(), plan_id='gratis').status_code, 400)
 
     def test_rejects_active_subdomain(self):
-        Tenant.objects.create(subdomain='elsabrosito', restaurant_name='Otro', plan_id='pro', status=Tenant.Status.ACTIVE)
+        Tenant.objects.create(subdominio='elsabrosito', nombre='Otro', plan_id='pro', estado=Tenant.Status.ACTIVE)
         client = stripe_client()
         self.assertEqual(self.post(client).status_code, 409)
         client.v1.checkout.sessions.create.assert_not_called()
 
     def test_new_checkout_expires_previous_unpaid_one(self):
-        Tenant.objects.create(subdomain='elsabrosito', restaurant_name='Otro', plan_id='expreso', stripe_session_id='cs_old')
+        Tenant.objects.create(subdominio='elsabrosito', nombre='Otro', plan_id='expreso', stripe_session_id='cs_old')
         client = stripe_client()
         client.v1.checkout.sessions.retrieve.return_value = SimpleNamespace(status='open')
 
         self.assertEqual(self.post(client).status_code, 201)
 
         client.v1.checkout.sessions.expire.assert_called_once_with('cs_old')
-        tenant = Tenant.objects.get(subdomain='elsabrosito')
+        tenant = Tenant.objects.get(subdominio='elsabrosito')
         self.assertEqual((tenant.stripe_session_id, tenant.plan_id), ('cs_new', 'pro'))
 
     def test_rejects_subdomain_paid_while_webhook_is_in_flight(self):
-        Tenant.objects.create(subdomain='elsabrosito', restaurant_name='Otro', plan_id='pro', stripe_session_id='cs_old')
+        Tenant.objects.create(subdominio='elsabrosito', nombre='Otro', plan_id='pro', stripe_session_id='cs_old')
         client = stripe_client()
         client.v1.checkout.sessions.retrieve.return_value = SimpleNamespace(status='complete')
 
@@ -112,15 +115,15 @@ class CreateCheckoutSessionTests(TestCase):
         client.v1.checkout.sessions.create.side_effect = stripe.APIConnectionError('sin red')
 
         self.assertEqual(self.post(client).status_code, 502)
-        self.assertFalse(Tenant.objects.filter(subdomain='elsabrosito').exists())
+        self.assertFalse(Tenant.objects.filter(subdominio='elsabrosito').exists())
 
 
 @override_settings(STRIPE_WEBHOOK_SECRET=WEBHOOK_SECRET)
 class StripeWebhookTests(TestCase):
     def setUp(self):
         self.tenant = Tenant.objects.create(
-            subdomain='elsabrosito',
-            restaurant_name='El Sabrosito',
+            subdominio='elsabrosito',
+            nombre='El Sabrosito',
             plan_id='pro',
             stripe_session_id='cs_paid',
         )
@@ -136,7 +139,9 @@ class StripeWebhookTests(TestCase):
                 'payment_status': payment_status,
                 'customer': 'cus_1',
                 'subscription': 'sub_1',
-                'customer_details': {'email': 'dueno@example.com'},
+                'customer_details': {'email': 'dueno@example.com', 'phone': None},
+                'amount_total': 19900,
+                'currency': 'pen',
                 'metadata': {'subdomain': 'elsabrosito', 'restaurant_name': 'El Sabrosito', 'plan_id': 'pro'},
             }},
         })
@@ -154,7 +159,7 @@ class StripeWebhookTests(TestCase):
     def test_rejects_invalid_signature(self):
         self.assertEqual(self.post(self.event_body(), secret='whsec_other').status_code, 400)
         self.tenant.refresh_from_db()
-        self.assertEqual(self.tenant.status, Tenant.Status.PENDING)
+        self.assertEqual(self.tenant.estado, Tenant.Status.PENDING)
 
     @override_settings(STRIPE_WEBHOOK_SECRET='')
     def test_refuses_events_without_configured_secret(self):
@@ -164,22 +169,84 @@ class StripeWebhookTests(TestCase):
         self.assertEqual(self.post(self.event_body()).status_code, 200)
 
         self.tenant.refresh_from_db()
-        self.assertEqual(self.tenant.status, Tenant.Status.ACTIVE)
-        self.assertEqual(self.tenant.stripe_subscription_id, 'sub_1')
+        self.assertEqual(self.tenant.estado, Tenant.Status.ACTIVE)
+        self.assertEqual(self.tenant.email_admin, 'dueno@example.com')
         owner = self.tenant.owner
         self.assertEqual((owner.username, owner.email), ('elsabrosito', 'dueno@example.com'))
         self.assertEqual(len(mail.outbox), 1)
         password = mail.outbox[0].body.split('Contraseña temporal: ')[1].strip()
         self.assertTrue(owner.check_password(password))
 
+    def test_records_license_and_payment(self):
+        self.post(self.event_body())
+
+        license_ = Licencia.objects.get(restaurante=self.tenant)
+        self.assertEqual(license_.plan, 'pro')
+        self.assertEqual(license_.monto_pagado, Decimal('199.00'))
+        self.assertEqual(license_.stripe_subscription_id, 'sub_1')
+        self.assertGreater(license_.fecha_vencimiento, license_.fecha_inicio)
+        payment = PagoStripe.objects.get(restaurante=self.tenant)
+        self.assertEqual((payment.stripe_checkout_id, payment.moneda), ('cs_paid', 'pen'))
+        self.assertEqual(payment.raw_payload['id'], 'cs_paid')
+
+    def invoice_body(self, invoice_id='in_1', billing_reason='subscription_cycle'):
+        return json.dumps({
+            'id': 'evt_2',
+            'object': 'event',
+            'type': 'invoice.paid',
+            'data': {'object': {
+                'id': invoice_id,
+                'object': 'invoice',
+                'billing_reason': billing_reason,
+                'amount_paid': 19900,
+                'currency': 'pen',
+                'parent': {'subscription_details': {'subscription': 'sub_1'}},
+                'lines': {'object': 'list', 'data': [{'period': {'end': 1893456000}}]},
+            }},
+        })
+
+    def test_renewal_extends_license_once(self):
+        self.post(self.event_body())
+
+        self.assertEqual(self.post(self.invoice_body()).status_code, 200)
+        self.assertEqual(self.post(self.invoice_body()).status_code, 200)
+
+        license_ = Licencia.objects.get(restaurante=self.tenant)
+        self.assertEqual(license_.fecha_vencimiento.year, 2029)
+        self.assertEqual(license_.monto_pagado, Decimal('398.00'))
+        self.assertEqual(PagoStripe.objects.filter(restaurante=self.tenant).count(), 2)
+
+    def test_first_invoice_is_not_a_renewal(self):
+        self.post(self.event_body())
+        self.post(self.invoice_body(billing_reason='subscription_create'))
+
+        self.assertEqual(PagoStripe.objects.filter(restaurante=self.tenant).count(), 1)
+
+    def test_deleted_subscription_cancels_license_and_suspends_tenant(self):
+        self.post(self.event_body())
+        body = json.dumps({
+            'id': 'evt_3',
+            'object': 'event',
+            'type': 'customer.subscription.deleted',
+            'data': {'object': {'id': 'sub_1', 'object': 'subscription'}},
+        })
+
+        self.assertEqual(self.post(body).status_code, 200)
+
+        license_ = Licencia.objects.get(restaurante=self.tenant)
+        self.assertEqual(license_.estado, Licencia.Status.CANCELLED)
+        self.assertIsNotNone(license_.fecha_cancelacion)
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.estado, Tenant.Status.SUSPENDED)
+
     def test_waits_for_deferred_payment_before_activating(self):
         self.post(self.event_body(payment_status='unpaid'))
         self.tenant.refresh_from_db()
-        self.assertEqual(self.tenant.status, Tenant.Status.PENDING)
+        self.assertEqual(self.tenant.estado, Tenant.Status.PENDING)
 
         self.post(self.event_body(event_type='checkout.session.async_payment_succeeded'))
         self.tenant.refresh_from_db()
-        self.assertEqual(self.tenant.status, Tenant.Status.ACTIVE)
+        self.assertEqual(self.tenant.estado, Tenant.Status.ACTIVE)
 
     def test_repeated_event_is_idempotent(self):
         self.post(self.event_body())
@@ -194,23 +261,57 @@ class StripeWebhookTests(TestCase):
             self.assertEqual(self.post(self.event_body()).status_code, 500)
 
         self.tenant.refresh_from_db()
-        self.assertEqual(self.tenant.status, Tenant.Status.PENDING)
+        self.assertEqual(self.tenant.estado, Tenant.Status.PENDING)
         self.assertEqual(get_user_model().objects.count(), 0)
 
     def test_ignores_session_replaced_by_newer_checkout(self):
         self.assertEqual(self.post(self.event_body(session_id='cs_other')).status_code, 200)
         self.tenant.refresh_from_db()
-        self.assertEqual(self.tenant.status, Tenant.Status.PENDING)
+        self.assertEqual(self.tenant.estado, Tenant.Status.PENDING)
 
     def test_ignores_other_events(self):
-        self.assertEqual(self.post(self.event_body(event_type='invoice.paid')).status_code, 200)
+        self.assertEqual(self.post(self.event_body(event_type='customer.created')).status_code, 200)
         self.tenant.refresh_from_db()
-        self.assertEqual(self.tenant.status, Tenant.Status.PENDING)
+        self.assertEqual(self.tenant.estado, Tenant.Status.PENDING)
+
+
+class LicenseStatusTests(TestCase):
+    def test_active_license_expires_when_its_date_passes(self):
+        tenant = Tenant.objects.create(subdominio='viejo', nombre='Viejo', plan_id='pro')
+        today = timezone.localdate()
+        license_ = Licencia.objects.create(
+            restaurante=tenant,
+            plan='pro',
+            fecha_inicio=today - timedelta(days=40),
+            fecha_vencimiento=today - timedelta(days=1),
+        )
+
+        self.assertEqual(license_.estado_actual, Licencia.Status.EXPIRED)
+        self.assertIn(license_, Licencia.objects.vencidas())
+        self.assertNotIn(license_, Licencia.objects.vigentes())
+
+
+class LandingCorsTests(TestCase):
+    def preflight(self, path, origin):
+        return self.client.options(
+            path,
+            headers={'Origin': origin, 'Access-Control-Request-Method': 'POST'},
+        )
+
+    @override_settings(LANDING_URL='https://delismart.publicvm.com')
+    def test_landing_reaches_checkout_only(self):
+        origin = 'https://delismart.publicvm.com'
+        self.assertIn('Access-Control-Allow-Origin', self.preflight(CHECKOUT_URL, origin).headers)
+        self.assertNotIn('Access-Control-Allow-Origin', self.preflight('/api/v1/admin/metrics/', origin).headers)
+
+    def test_admin_origin_is_allowed(self):
+        response = self.preflight('/api/v1/admin/metrics/', 'http://localhost:5173')
+        self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), 'http://localhost:5173')
 
 
 class TenantStatusTests(TestCase):
     def test_returns_active_tenant(self):
-        Tenant.objects.create(subdomain='elsabrosito', restaurant_name='El Sabrosito', plan_id='pro', status=Tenant.Status.ACTIVE)
+        Tenant.objects.create(subdominio='elsabrosito', nombre='El Sabrosito', plan_id='pro', estado=Tenant.Status.ACTIVE)
         response = self.client.get('/api/tenants/elsabrosito/status/')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
@@ -221,6 +322,6 @@ class TenantStatusTests(TestCase):
         })
 
     def test_hides_unpaid_and_unknown_tenants(self):
-        Tenant.objects.create(subdomain='pendiente', restaurant_name='Sin pagar', plan_id='pro')
+        Tenant.objects.create(subdominio='pendiente', nombre='Sin pagar', plan_id='pro')
         self.assertEqual(self.client.get('/api/tenants/pendiente/status/').status_code, 404)
         self.assertEqual(self.client.get('/api/tenants/noexiste/status/').status_code, 404)

@@ -14,7 +14,7 @@ from rest_framework.views import APIView
 
 from .models import Tenant
 from .serializers import CheckoutSessionSerializer, TenantStatusSerializer
-from .services import SubdomainTaken, provision_tenant, start_checkout
+from .services import SubdomainTaken, cancel_subscription, provision_tenant, renew_license, start_checkout
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class TenantStatusView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, subdomain):
-        tenant = get_object_or_404(Tenant.objects.exclude(status=Tenant.Status.PENDING), subdomain=subdomain)
+        tenant = get_object_or_404(Tenant.objects.exclude(estado=Tenant.Status.PENDING), subdominio=subdomain)
         return Response(TenantStatusSerializer(tenant).data)
 
 
@@ -70,4 +70,8 @@ def stripe_webhook(request):
 
     if event.type in ('checkout.session.completed', 'checkout.session.async_payment_succeeded'):
         provision_tenant(event.data.object)
+    elif event.type == 'invoice.paid':
+        renew_license(event.data.object)
+    elif event.type == 'customer.subscription.deleted':
+        cancel_subscription(event.data.object)
     return HttpResponse(status=200)
