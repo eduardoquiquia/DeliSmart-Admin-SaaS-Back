@@ -10,6 +10,7 @@ from tenants.models import Licencia, PagoStripe, Tenant
 from tenants.plans import PLANS, annual_amount, monthly_equivalent
 
 from .licenses import LicenseSerializer
+from .payments import PaymentSerializer
 from .permissions import IsSuperuser
 from .tenants import TenantSerializer, tenants_with_license
 
@@ -45,6 +46,7 @@ class MetricsView(APIView):
         recent = (
             tenants_with_license().exclude(stripe_customer_id='').order_by('-fecha_creacion')[:RECENT_LIMIT]
         )
+        payments = PagoStripe.objects.select_related('restaurante').order_by('-fecha_pago', '-id')[:RECENT_LIMIT]
         return Response({
             'restaurantes_activos': Tenant.objects.filter(estado=Tenant.Status.ACTIVE).count(),
             'mrr': _soles(sum(monthly_equivalent(item.plan, item.restaurante.billing_cycle) for item in current)),
@@ -55,6 +57,7 @@ class MetricsView(APIView):
             'pedidos_globales': None,
             'licencias_por_vencer': LicenseSerializer(expiring, many=True).data,
             'ultimos_restaurantes': TenantSerializer(recent, many=True).data,
+            'ultimos_pagos': PaymentSerializer(payments, many=True).data,
         })
 
 

@@ -67,6 +67,19 @@ class MetricsTests(TestCase):
 
         self.assertEqual(self.api.get(URL).data['ingresos_totales'], Decimal('302.00'))
 
+    def test_lists_latest_payments_first(self, _):
+        tenant = make_tenant()
+        for index in range(6):
+            PagoStripe.objects.create(
+                restaurante=tenant, stripe_checkout_id=f'cs_{index}', monto='199.00', moneda='pen', raw_payload={},
+            )
+
+        rows = self.api.get(URL).data['ultimos_pagos']
+
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(rows[0]['stripe_checkout_id'], 'cs_5')
+        self.assertEqual(rows[0]['restaurante_subdominio'], 'elsabrosito')
+
     def test_lists_licenses_about_to_expire(self, _):
         soon = make_license(make_tenant('pronto'), days_left=3)
         make_license(make_tenant('lejos'), days_left=20)
