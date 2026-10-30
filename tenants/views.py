@@ -68,6 +68,6 @@ def stripe_webhook(request):
     except (ValueError, stripe.SignatureVerificationError):
         return HttpResponse(status=400)
 
-    if event.type == 'checkout.session.completed':
+    if event.type in ('checkout.session.completed', 'checkout.session.async_payment_succeeded'):
         provision_tenant(event.data.object)
     return HttpResponse(status=200)

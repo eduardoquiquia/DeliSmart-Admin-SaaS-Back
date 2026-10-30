@@ -33,7 +33,6 @@ def start_checkout(data):
     try:
         session = client.v1.checkout.sessions.create(params={
             'mode': 'subscription',
-            'payment_method_types': ['card'],
             'locale': 'es',
             'line_items': [{
                 'quantity': 1,
@@ -86,6 +85,10 @@ def _reserve_subdomain(client, data):
 @transaction.atomic
 def provision_tenant(session):
     """Activa el tenant de una sesión pagada. Stripe puede repetir el evento."""
+    # Los métodos de pago diferidos completan el checkout antes de cobrar.
+    if session.payment_status == 'unpaid':
+        return
+
     tenant = (
         Tenant.objects.select_for_update()
         .filter(subdomain=session.metadata.subdomain, stripe_session_id=session.id)

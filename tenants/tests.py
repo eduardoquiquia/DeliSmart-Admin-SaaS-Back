@@ -125,7 +125,7 @@ class StripeWebhookTests(TestCase):
             stripe_session_id='cs_paid',
         )
 
-    def event_body(self, event_type='checkout.session.completed', session_id='cs_paid'):
+    def event_body(self, event_type='checkout.session.completed', session_id='cs_paid', payment_status='paid'):
         return json.dumps({
             'id': 'evt_1',
             'object': 'event',
@@ -133,6 +133,7 @@ class StripeWebhookTests(TestCase):
             'data': {'object': {
                 'id': session_id,
                 'object': 'checkout.session',
+                'payment_status': payment_status,
                 'customer': 'cus_1',
                 'subscription': 'sub_1',
                 'customer_details': {'email': 'dueno@example.com'},
@@ -170,6 +171,15 @@ class StripeWebhookTests(TestCase):
         self.assertEqual(len(mail.outbox), 1)
         password = mail.outbox[0].body.split('Contraseña temporal: ')[1].strip()
         self.assertTrue(owner.check_password(password))
+
+    def test_waits_for_deferred_payment_before_activating(self):
+        self.post(self.event_body(payment_status='unpaid'))
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.status, Tenant.Status.PENDING)
+
+        self.post(self.event_body(event_type='checkout.session.async_payment_succeeded'))
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.status, Tenant.Status.ACTIVE)
 
     def test_repeated_event_is_idempotent(self):
         self.post(self.event_body())
