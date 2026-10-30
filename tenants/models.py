@@ -33,6 +33,7 @@ class Tenant(models.Model):
     )
     stripe_session_id = models.CharField(max_length=255, blank=True)
     stripe_customer_id = models.CharField(max_length=255, blank=True)
+    login_issued_at = models.DateTimeField(null=True, blank=True)
     fecha_creacion = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

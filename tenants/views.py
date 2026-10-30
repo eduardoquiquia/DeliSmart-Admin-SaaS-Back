@@ -12,9 +12,21 @@ from rest_framework.response import Response
 from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
 
+from rest_framework_simplejwt.tokens import RefreshToken
+
 from .models import Tenant
-from .serializers import CheckoutSessionSerializer, TenantStatusSerializer
-from .services import SubdomainTaken, cancel_subscription, provision_tenant, renew_license, start_checkout
+from .serializers import CheckoutSessionSerializer, CompleteCheckoutSerializer, TenantStatusSerializer
+from .services import (
+    CheckoutLoginUsed,
+    CheckoutNotPaid,
+    EmailTaken,
+    SubdomainTaken,
+    cancel_subscription,
+    complete_checkout,
+    provision_tenant,
+    renew_license,
+    start_checkout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +46,11 @@ class CreateCheckoutSessionView(APIView):
                 {'subdomain': ['Este subdominio ya está en uso.']},
                 status=status.HTTP_409_CONFLICT,
             )
+        except EmailTaken:
+            return Response(
+                {'email': ['Este correo ya tiene una cuenta. Inicia sesión para continuar.']},
+                status=status.HTTP_409_CONFLICT,
+            )
         except stripe.StripeError:
             logger.exception('No se pudo crear la sesión de Stripe')
             return Response(
@@ -41,6 +58,32 @@ class CreateCheckoutSessionView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
         return Response({'checkout_url': session.url}, status=status.HTTP_201_CREATED)
+
+
+class CompleteCheckoutView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [AnonRateThrottle]
+
+    def post(self, request):
+        serializer = CompleteCheckoutSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            owner = complete_checkout(serializer.validated_data['session_id'])
+        except Tenant.DoesNotExist:
+            return Response({'detail': 'No encontramos esta compra.'}, status=status.HTTP_404_NOT_FOUND)
+        except CheckoutNotPaid:
+            return Response({'detail': 'El pago aún se está confirmando.'}, status=status.HTTP_202_ACCEPTED)
+        except CheckoutLoginUsed:
+            return Response({'detail': 'Esta compra ya inició sesión.'}, status=status.HTTP_410_GONE)
+        except stripe.StripeError:
+            logger.exception('No se pudo confirmar la sesión de Stripe')
+            return Response(
+                {'detail': 'No pudimos confirmar el pago. Inténtalo de nuevo.'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        refresh = RefreshToken.for_user(owner)
+        return Response({'access': str(refresh.access_token), 'refresh': str(refresh)})
 
 
 class TenantStatusView(APIView):

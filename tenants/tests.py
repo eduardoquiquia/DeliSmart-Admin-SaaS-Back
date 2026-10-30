@@ -17,18 +17,25 @@ from rest_framework.test import APIClient
 
 from .models import Licencia, PagoStripe, Tenant
 from .plans import stripe_price_data
-from .services import sync_pending_checkouts
+from .services import provision_tenant, sync_pending_checkouts
 
 CHECKOUT_URL = '/api/stripe/create-checkout-session/'
 WEBHOOK_URL = '/api/stripe/webhook/'
 WEBHOOK_SECRET = 'whsec_unit_test'
+PASSWORD = 'clave-segura-123'
 
 
 def checkout_payload(**overrides):
     return {
         'plan_id': 'pro',
         'billing_cycle': 'monthly',
+        'first_name': 'Ana',
+        'last_name': 'Quispe',
+        'email': 'Ana@Example.com',
+        'phone': '+51987654321',
+        'password': PASSWORD,
         'restaurant_name': 'El Sabrosito',
+        'ruc': '20123456789',
         'subdomain': 'elsabrosito',
         **overrides,
     }
@@ -36,6 +43,7 @@ def checkout_payload(**overrides):
 
 def stripe_client(session_id='cs_new'):
     client = MagicMock()
+    client.v1.customers.create.return_value = SimpleNamespace(id='cus_new')
     sessions = client.v1.checkout.sessions
     sessions.create.return_value = SimpleNamespace(id=session_id, url=f'https://checkout.stripe.test/{session_id}')
     return client
@@ -117,6 +125,145 @@ class CreateCheckoutSessionTests(TestCase):
 
         self.assertEqual(self.post(client).status_code, 502)
         self.assertFalse(Tenant.objects.filter(subdominio='elsabrosito').exists())
+        self.assertFalse(get_user_model().objects.exists())
+
+    def test_registers_inactive_owner_tenant_and_stripe_customer(self):
+        client = stripe_client()
+        self.assertEqual(self.post(client).status_code, 201)
+
+        tenant = Tenant.objects.get(subdominio='elsabrosito')
+        owner = tenant.owner
+        self.assertEqual((owner.email, owner.first_name, owner.last_name), ('ana@example.com', 'Ana', 'Quispe'))
+        self.assertFalse(owner.is_active)
+        self.assertTrue(owner.check_password(PASSWORD))
+        self.assertEqual((tenant.ruc, tenant.telefono, tenant.email_admin), ('20123456789', '+51987654321', 'ana@example.com'))
+        self.assertEqual(tenant.stripe_customer_id, 'cus_new')
+
+        params = client.v1.checkout.sessions.create.call_args.kwargs['params']
+        self.assertEqual(params['customer'], 'cus_new')
+        self.assertIn('session_id={CHECKOUT_SESSION_ID}', params['success_url'])
+        customer = client.v1.customers.create.call_args.kwargs['params']
+        self.assertEqual((customer['email'], customer['name']), ('ana@example.com', 'Ana Quispe'))
+
+    def test_password_is_not_sent_to_stripe(self):
+        client = stripe_client()
+        self.post(client)
+        self.assertNotIn(PASSWORD, str(client.mock_calls))
+
+    def test_rejects_weak_password_and_invalid_ruc(self):
+        self.assertEqual(self.post(stripe_client(), password='123').status_code, 400)
+        self.assertEqual(self.post(stripe_client(), ruc='123').status_code, 400)
+
+    def test_rejects_email_of_an_active_account(self):
+        get_user_model().objects.create_user('ana', 'ana@example.com', PASSWORD)
+        client = stripe_client()
+
+        response = self.post(client)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('email', response.data)
+        client.v1.customers.create.assert_not_called()
+
+    def test_failed_reservation_leaves_no_account(self):
+        Tenant.objects.create(subdominio='elsabrosito', nombre='Otro', plan_id='pro', estado=Tenant.Status.ACTIVE)
+        self.assertEqual(self.post(stripe_client()).status_code, 409)
+        self.assertFalse(get_user_model().objects.exists())
+
+    def test_same_buyer_can_retry_with_another_subdomain(self):
+        client = stripe_client()
+        self.post(client)
+        client.v1.checkout.sessions.retrieve.return_value = SimpleNamespace(status='open')
+
+        response = self.post(client, subdomain='otro-local', password='otra-clave-segura-456')
+
+        self.assertEqual(response.status_code, 201)
+        client.v1.checkout.sessions.expire.assert_called_once_with('cs_new')
+        self.assertEqual(list(Tenant.objects.values_list('subdominio', flat=True)), ['otro-local'])
+        owner = get_user_model().objects.get()
+        self.assertTrue(owner.check_password('otra-clave-segura-456'))
+
+    def test_new_buyer_replaces_unpaid_owner_of_the_subdomain(self):
+        client = stripe_client()
+        self.post(client)
+        client.v1.checkout.sessions.retrieve.return_value = SimpleNamespace(status='open')
+
+        self.assertEqual(self.post(client, email='luis@example.com').status_code, 201)
+
+        owner = Tenant.objects.get(subdominio='elsabrosito').owner
+        self.assertEqual(owner.email, 'luis@example.com')
+        self.assertEqual(get_user_model().objects.count(), 1)
+        self.assertEqual(client.v1.customers.create.call_count, 2)
+
+
+class CompleteCheckoutTests(TestCase):
+    URL = '/api/stripe/complete-checkout/'
+
+    def setUp(self):
+        cache.clear()
+        self.owner = get_user_model().objects.create_user(
+            'ana@example.com', 'ana@example.com', PASSWORD, is_active=False,
+        )
+        self.tenant = Tenant.objects.create(
+            subdominio='elsabrosito', nombre='El Sabrosito', plan_id='pro', owner=self.owner,
+            email_admin='ana@example.com', stripe_customer_id='cus_new', stripe_session_id='cs_paid',
+        )
+
+    def session(self, status='complete', payment_status='paid'):
+        return stripe.checkout.Session.construct_from({
+            'id': 'cs_paid',
+            'object': 'checkout.session',
+            'status': status,
+            'payment_status': payment_status,
+            'customer': 'cus_new',
+            'subscription': 'sub_1',
+            'customer_details': {'email': 'ana@example.com', 'phone': None},
+            'amount_total': 19900,
+            'currency': 'pen',
+            'metadata': {'subdomain': 'elsabrosito', 'restaurant_name': 'El Sabrosito', 'plan_id': 'pro'},
+        }, 'sk_test')
+
+    def post(self, session=None, session_id='cs_paid'):
+        client = MagicMock()
+        client.v1.checkout.sessions.retrieve.return_value = session or self.session()
+        with patch('tenants.services.get_stripe_client', return_value=client):
+            return APIClient().post(self.URL, {'session_id': session_id}, format='json')
+
+    def test_activates_owner_and_returns_working_tokens(self):
+        response = self.post()
+
+        self.assertEqual(response.status_code, 200)
+        self.owner.refresh_from_db()
+        self.assertTrue(self.owner.is_active)
+        self.assertEqual(Licencia.objects.get(restaurante=self.tenant).plan, 'pro')
+        self.assertEqual(mail.outbox[0].to, ['ana@example.com'])
+        self.assertNotIn(PASSWORD, mail.outbox[0].body)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {response.data['access']}")
+        self.assertEqual(api.get('/api/v1/admin/my-plan/').status_code, 200)
+
+    def test_keeps_stripe_customer(self):
+        self.post()
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.stripe_customer_id, 'cus_new')
+
+    def test_session_logs_in_only_once(self):
+        self.assertEqual(self.post().status_code, 200)
+        self.assertEqual(self.post().status_code, 410)
+
+    def test_unpaid_session_gets_no_tokens(self):
+        response = self.post(self.session(status='open', payment_status='unpaid'))
+
+        self.assertEqual(response.status_code, 202)
+        self.assertNotIn('access', response.data)
+        self.owner.refresh_from_db()
+        self.assertFalse(self.owner.is_active)
+
+    def test_unknown_session_is_rejected(self):
+        self.assertEqual(self.post(session_id='cs_other').status_code, 404)
+
+    def test_webhook_activation_still_allows_login(self):
+        provision_tenant(self.session())
+        self.assertEqual(self.post().status_code, 200)
 
 
 @override_settings(STRIPE_WEBHOOK_SECRET=WEBHOOK_SECRET)
@@ -369,6 +516,11 @@ class LandingCorsTests(TestCase):
         origin = 'https://delismart.publicvm.com'
         self.assertIn('Access-Control-Allow-Origin', self.preflight(CHECKOUT_URL, origin).headers)
         self.assertNotIn('Access-Control-Allow-Origin', self.preflight('/api/v1/admin/metrics/', origin).headers)
+
+    @override_settings(LANDING_URL='https://delismart.publicvm.com')
+    def test_landing_reaches_login(self):
+        response = self.preflight('/api/v1/admin/auth/login/', 'https://delismart.publicvm.com')
+        self.assertIn('Access-Control-Allow-Origin', response.headers)
 
     def test_admin_origin_is_allowed(self):
         response = self.preflight('/api/v1/admin/metrics/', 'http://localhost:5173')

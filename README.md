@@ -28,11 +28,15 @@ El endpoint `/api/stripe/webhook/` debe recibir estos eventos:
 - `invoice.paid`
 - `customer.subscription.deleted`
 
-Si un webhook no llega, por ejemplo en local sin `stripe listen`, el panel consulta cada minuto `stripe/sync/`. Ese endpoint pregunta a Stripe por los checkouts pendientes y activa los pagados.
+Si un webhook no llega, por ejemplo en local sin `stripe listen`, hay dos respaldos que preguntan a Stripe por el pago. Al volver del checkout, el landing llama a `POST /api/stripe/complete-checkout/`, que activa la cuenta y entrega los tokens una sola vez. Además, el panel de un superusuario consulta cada minuto `stripe/sync/`.
+
+## Registro y acceso
+
+`POST /api/stripe/create-checkout-session/` recibe los datos del dueño y del restaurante. Crea el usuario inactivo, el tenant pendiente y el cliente de Stripe, y los enlaza. El pago activa el usuario. Los dueños entran con su correo desde el login del landing y solo ven `my-plan/`; los superusuarios ven toda la API.
 
 ## API del panel
 
-Todo cuelga de `/api/v1/admin/` y exige un JWT de superusuario, salvo `health/` y `auth/login/`.
+Todo cuelga de `/api/v1/admin/` y exige un JWT de superusuario, salvo `health/`, `auth/login/`, y `auth/me/`, `plans/` y `my-plan/`, abiertos a los dueños.
 
 | Ruta | Uso |
 | --- | --- |
@@ -43,4 +47,5 @@ Todo cuelga de `/api/v1/admin/` y exige un JWT de superusuario, salvo `health/` 
 | `payments/` | Historial, `search`, `page` |
 | `stripe/sync/` | Activa checkouts pagados sin webhook |
 | `plans/` | Catálogo de planes |
+| `my-plan/` | Restaurante, licencia y pagos del dueño |
 | `health/` | Estado del servidor |
