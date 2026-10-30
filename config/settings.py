@@ -11,9 +11,11 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import dj_database_url
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -30,13 +32,16 @@ def env_list(name, default=''):
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get(
-    'DJANGO_SECRET_KEY',
-    'django-insecure-x+lf6n=6x6ufk^b8)8%+pl1p4)%d3@utd*%%-7=n0yq=@fs*tx',
-)
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', '')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', 'true').lower() == 'true'
+
+# La clave firma los JWT de superusuario: fuera de desarrollo no puede ser pública.
+if not SECRET_KEY:
+    if not DEBUG:
+        raise ImproperlyConfigured('DJANGO_SECRET_KEY es obligatoria con DJANGO_DEBUG=false.')
+    SECRET_KEY = 'django-insecure-x+lf6n=6x6ufk^b8)8%+pl1p4)%d3@utd*%%-7=n0yq=@fs*tx'
 
 ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS')
 
@@ -52,7 +57,9 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'corsheaders',
+    'rest_framework_simplejwt',
     'tenants',
+    'admin_api',
 ]
 
 MIDDLEWARE = [
@@ -89,9 +96,13 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+if not DATABASE_URL.startswith(('postgres://', 'postgresql://')):
+    raise ImproperlyConfigured('DATABASE_URL debe ser la cadena de conexión PostgreSQL de Neon.')
+
 DATABASES = {
-    'default': dj_database_url.config(
-        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
+    'default': dj_database_url.parse(
+        DATABASE_URL,
         conn_max_age=60,
         conn_health_checks=True,
     )
@@ -122,7 +133,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'America/Lima'
 
 USE_I18N = True
 
@@ -149,13 +160,19 @@ DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'DeliSmart <no-reply@d
 
 # CORS
 
-CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS', 'http://localhost:3000')
+CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS', 'https://admin.delismart.com,http://localhost:5173')
 
 
 # Django REST Framework
 
 REST_FRAMEWORK = {
-    'DEFAULT_THROTTLE_RATES': {'anon': '30/hour'},
+    'DEFAULT_AUTHENTICATION_CLASSES': ['rest_framework_simplejwt.authentication.JWTAuthentication'],
+    'DEFAULT_THROTTLE_RATES': {'anon': '30/hour', 'admin_login': '10/minute'},
+}
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
 }
 
 
