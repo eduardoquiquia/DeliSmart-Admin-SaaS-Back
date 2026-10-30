@@ -1,9 +1,16 @@
+import logging
+import secrets
+
 import stripe
 from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.core.mail import send_mail
 from django.db import IntegrityError, transaction
 
 from .models import Tenant
 from .plans import stripe_price_data
+
+logger = logging.getLogger(__name__)
 
 
 class SubdomainTaken(Exception):
@@ -74,3 +81,42 @@ def _reserve_subdomain(client, data):
         tenant.stripe_session_id = ''
         tenant.save()
         return tenant
+
+
+@transaction.atomic
+def provision_tenant(session):
+    """Activa el tenant de una sesión pagada. Stripe puede repetir el evento."""
+    tenant = (
+        Tenant.objects.select_for_update()
+        .filter(subdomain=session.metadata.subdomain, stripe_session_id=session.id)
+        .first()
+    )
+    if tenant is None:
+        logger.error('Pago sin tenant reservado: sesión %s', session.id)
+        return
+    if tenant.status != Tenant.Status.PENDING:
+        return
+
+    email = session.customer_details.email
+    password = secrets.token_urlsafe(12)
+    tenant.owner = get_user_model().objects.create_user(
+        username=tenant.subdomain,
+        email=email,
+        password=password,
+    )
+    tenant.status = Tenant.Status.ACTIVE
+    tenant.stripe_customer_id = session.customer or ''
+    tenant.stripe_subscription_id = session.subscription or ''
+    tenant.save()
+
+    # Si el correo falla se revierte todo y Stripe reintenta: la contraseña no se guarda en claro.
+    send_mail(
+        subject=f'Tu acceso a DeliSmart: {tenant.restaurant_name}',
+        message=(
+            f'Tu restaurante ya está activo en https://{tenant.subdomain}.{settings.ROOT_DOMAIN}\n\n'
+            f'Usuario: {tenant.subdomain}\n'
+            f'Contraseña temporal: {password}\n'
+        ),
+        from_email=None,
+        recipient_list=[email],
+    )
