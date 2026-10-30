@@ -5,7 +5,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .auth import HealthView, LoginView, ProfileView
 from .licenses import LicenseViewSet
 from .metrics import MetricsView, PlanListView
-from .payments import PaymentListView
+from .payments import PaymentListView, StripeSyncView
 from .tenants import TenantViewSet
 
 router = DefaultRouter()
@@ -20,5 +20,6 @@ urlpatterns = [
     path('metrics/', MetricsView.as_view()),
     path('plans/', PlanListView.as_view()),
     path('payments/', PaymentListView.as_view()),
+    path('stripe/sync/', StripeSyncView.as_view()),
     *router.urls,
 ]

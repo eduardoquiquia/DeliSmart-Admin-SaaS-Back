@@ -17,6 +17,7 @@ from rest_framework.test import APIClient
 
 from .models import Licencia, PagoStripe, Tenant
 from .plans import stripe_price_data
+from .services import sync_pending_checkouts
 
 CHECKOUT_URL = '/api/stripe/create-checkout-session/'
 WEBHOOK_URL = '/api/stripe/webhook/'
@@ -273,6 +274,71 @@ class StripeWebhookTests(TestCase):
         self.assertEqual(self.post(self.event_body(event_type='customer.created')).status_code, 200)
         self.tenant.refresh_from_db()
         self.assertEqual(self.tenant.estado, Tenant.Status.PENDING)
+
+
+class SyncPendingCheckoutsTests(TestCase):
+    def setUp(self):
+        self.tenant = Tenant.objects.create(
+            subdominio='elsabrosito', nombre='El Sabrosito', plan_id='pro', stripe_session_id='cs_paid',
+        )
+
+    def session(self, status='complete', payment_status='paid'):
+        return stripe.checkout.Session.construct_from({
+            'id': 'cs_paid',
+            'object': 'checkout.session',
+            'status': status,
+            'payment_status': payment_status,
+            'customer': 'cus_1',
+            'subscription': 'sub_1',
+            'customer_details': {'email': 'dueno@example.com', 'phone': None},
+            'amount_total': 19900,
+            'currency': 'pen',
+            'metadata': {'subdomain': 'elsabrosito', 'restaurant_name': 'El Sabrosito', 'plan_id': 'pro'},
+        }, 'sk_test')
+
+    def sync(self, client):
+        with patch('tenants.services.get_stripe_client', return_value=client):
+            return sync_pending_checkouts()
+
+    def client_returning(self, session):
+        client = MagicMock()
+        client.v1.checkout.sessions.retrieve.return_value = session
+        return client
+
+    def test_activates_paid_checkout_without_webhook(self):
+        self.assertEqual(self.sync(self.client_returning(self.session())), 1)
+
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.estado, Tenant.Status.ACTIVE)
+        self.assertEqual(Licencia.objects.get(restaurante=self.tenant).plan, 'pro')
+        self.assertEqual(PagoStripe.objects.get(restaurante=self.tenant).stripe_checkout_id, 'cs_paid')
+
+    def test_is_idempotent(self):
+        client = self.client_returning(self.session())
+
+        self.sync(client)
+
+        self.assertEqual(self.sync(client), 0)
+        self.assertEqual(PagoStripe.objects.count(), 1)
+
+    def test_leaves_unpaid_checkout_pending(self):
+        self.assertEqual(self.sync(self.client_returning(self.session(status='open', payment_status='unpaid'))), 0)
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.estado, Tenant.Status.PENDING)
+
+    def test_skips_expired_checkouts(self):
+        old = timezone.now() - timedelta(hours=26)
+        Tenant.objects.filter(pk=self.tenant.pk).update(updated_at=old)
+        client = self.client_returning(self.session())
+
+        self.assertEqual(self.sync(client), 0)
+        client.v1.checkout.sessions.retrieve.assert_not_called()
+
+    def test_stripe_error_does_not_stop_the_sync(self):
+        client = MagicMock()
+        client.v1.checkout.sessions.retrieve.side_effect = stripe.APIConnectionError('sin red')
+
+        self.assertEqual(self.sync(client), 0)
 
 
 class LicenseStatusTests(TestCase):

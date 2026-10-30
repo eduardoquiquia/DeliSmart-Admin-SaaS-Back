@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -6,6 +8,7 @@ from tenants.models import PagoStripe
 from .helpers import make_tenant, superuser_client
 
 URL = '/api/v1/admin/payments/'
+SYNC_URL = '/api/v1/admin/stripe/sync/'
 
 
 class PaymentApiTests(TestCase):
@@ -30,3 +33,10 @@ class PaymentApiTests(TestCase):
 
     def test_requires_superuser(self):
         self.assertEqual(APIClient().get(URL).status_code, 401)
+        self.assertEqual(APIClient().post(SYNC_URL).status_code, 401)
+
+    def test_sync_reports_activated_checkouts(self):
+        with patch('admin_api.payments.sync_pending_checkouts', return_value=2):
+            response = superuser_client().post(SYNC_URL)
+
+        self.assertEqual(response.data, {'activados': 2})

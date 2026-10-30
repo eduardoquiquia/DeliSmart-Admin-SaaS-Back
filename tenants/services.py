@@ -1,7 +1,7 @@
 import calendar
 import logging
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import stripe
@@ -15,6 +15,9 @@ from .models import Licencia, PagoStripe, Tenant
 from .plans import stripe_price_data
 
 logger = logging.getLogger(__name__)
+
+# Stripe expira una sesión de checkout sin pagar a las 24 horas.
+CHECKOUT_LIFETIME = timedelta(hours=25)
 
 
 class SubdomainTaken(Exception):
@@ -158,6 +161,27 @@ def provision_tenant(session):
         from_email=None,
         recipient_list=[email],
     )
+    return True
+
+
+def sync_pending_checkouts():
+    """Activa los checkouts pagados cuyo webhook no llegó. Devuelve cuántos activó."""
+    pending = Tenant.objects.filter(
+        estado=Tenant.Status.PENDING,
+        updated_at__gte=timezone.now() - CHECKOUT_LIFETIME,
+    ).exclude(stripe_session_id='')
+
+    activated = 0
+    client = get_stripe_client()
+    for tenant in pending:
+        try:
+            session = client.v1.checkout.sessions.retrieve(tenant.stripe_session_id)
+        except stripe.StripeError:
+            logger.exception('No se pudo consultar la sesión %s', tenant.stripe_session_id)
+            continue
+        if session.status == 'complete' and provision_tenant(session):
+            activated += 1
+    return activated
 
 
 def _invoice_subscription_id(invoice):

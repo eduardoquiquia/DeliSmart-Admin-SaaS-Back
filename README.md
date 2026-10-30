@@ -28,6 +28,8 @@ El endpoint `/api/stripe/webhook/` debe recibir estos eventos:
 - `invoice.paid`
 - `customer.subscription.deleted`
 
+Si un webhook no llega, por ejemplo en local sin `stripe listen`, el panel consulta cada minuto `stripe/sync/`. Ese endpoint pregunta a Stripe por los checkouts pendientes y activa los pagados.
+
 ## API del panel
 
 Todo cuelga de `/api/v1/admin/` y exige un JWT de superusuario, salvo `health/` y `auth/login/`.
@@ -39,5 +41,6 @@ Todo cuelga de `/api/v1/admin/` y exige un JWT de superusuario, salvo `health/` 
 | `tenants/` | CRUD, `search`, `estado`, `page` |
 | `licenses/` | CRUD, `search`, `estado`, `page` |
 | `payments/` | Historial, `search`, `page` |
+| `stripe/sync/` | Activa checkouts pagados sin webhook |
 | `plans/` | Catálogo de planes |
 | `health/` | Estado del servidor |
