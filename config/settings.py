@@ -43,7 +43,10 @@ if not SECRET_KEY:
         raise ImproperlyConfigured('DJANGO_SECRET_KEY es obligatoria con DJANGO_DEBUG=false.')
     SECRET_KEY = 'django-insecure-x+lf6n=6x6ufk^b8)8%+pl1p4)%d3@utd*%%-7=n0yq=@fs*tx'
 
-ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS')
+ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1')
+# Render publica el dominio del servicio en esta variable.
+if os.environ.get('RENDER_EXTERNAL_HOSTNAME'):
+    ALLOWED_HOSTS.append(os.environ['RENDER_EXTERNAL_HOSTNAME'])
 
 
 # Application definition
@@ -160,7 +163,9 @@ DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'DeliSmart <no-reply@d
 
 # CORS
 
-CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS', 'https://admin.delismart.com,http://localhost:5173')
+CORS_ALLOWED_ORIGINS = env_list(
+    'CORS_ALLOWED_ORIGINS', 'https://deli-smart-admin-saa-s.vercel.app,http://localhost:5173'
+)
 
 
 # Django REST Framework
@@ -182,3 +187,12 @@ STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
 STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 LANDING_URL = os.environ.get('LANDING_URL', 'http://localhost:3000').rstrip('/')
 ROOT_DOMAIN = os.environ.get('ROOT_DOMAIN', 'delismart.publicvm.com')
+
+
+# Panel de la pollería (delismart-restaurant-front y delismart-restaurant-back)
+
+RESTAURANT_FRONT_URL = os.environ.get(
+    'RESTAURANT_FRONT_URL', 'https://deli-smart-restaurant-front.vercel.app'
+).rstrip('/')
+# Compartido con restaurant-back: autoriza /api/internal/ y firma el acceso directo desde Mi Plan.
+INTERNAL_API_TOKEN = os.environ.get('INTERNAL_API_TOKEN', '')
