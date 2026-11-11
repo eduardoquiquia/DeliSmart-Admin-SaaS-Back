@@ -12,13 +12,18 @@ Class-based views
     2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
 Including another URLconf
     1. Import the include() function: from django.urls import include, path
+
+from tenants.internal import LicenseBySubdomainView
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
 from django.urls import include, path
 
+from tenants.internal import LicenseBySubdomainView
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('tenants.urls')),
     path('api/v1/admin/', include('admin_api.urls')),
+    path('api/internal/licencias/<str:subdominio>/', LicenseBySubdomainView.as_view()),
 ]
